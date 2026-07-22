@@ -72,7 +72,7 @@ extern int optind;
 #define MAX_BAD_BLOCKS (INT_MAX/2)
 
 static const char * program_name = "badblocks";
-static const char * done_string = N_("done                                                 \n");
+static const char * done_string = N_("done\r\n");
 
 static int v_flag;			/* verbose */
 static int w_flag;			/* do r/w test: 0=no, 1=yes,
@@ -88,8 +88,7 @@ static unsigned int max_bb = MAX_BAD_BLOCKS;	/* Abort test if more than this
 						 * number of bad blocks has been
 						 * encountered */
 static unsigned int d_flag;		/* delay factor between reads */
-static struct timeval time_start;
-
+static unsigned int status_interval = 1;	/* seconds between progress records */
 #define T_INC 32
 
 static unsigned int sys_page_size = 4096;
@@ -99,7 +98,8 @@ static void usage(void)
 	fprintf(stderr, _(
 "Usage: %s [-b block_size] [-i input_file] [-o output_file] [-svwnfBX]\n"
 "       [-c blocks_at_once] [-d delay_factor_between_reads] [-e max_bad_blocks]\n"
-"       [-p num_passes] [-t test_pattern [-t test_pattern [...]]]\n"
+"       [-p num_passes] [-S status_interval]\n"
+"       [-t test_pattern [-t test_pattern [...]]]\n"
 "       device [last_block [first_block]]\n"),
 		 program_name);
 	exit (1);
@@ -114,7 +114,6 @@ static void exclusive_usage(void)
 }
 
 static blk_t currently_testing = 0;
-static blk_t num_blocks = 0;
 static blk_t num_read_errors = 0;
 static blk_t num_write_errors = 0;
 static blk_t num_corruption_errors = 0;
@@ -124,6 +123,151 @@ static blk_t next_bad = 0;
 static ext2_badblocks_iterate bb_iter = NULL;
 
 enum error_types { READ_ERROR, WRITE_ERROR, CORRUPTION_ERROR };
+
+struct status_range {
+	int bad;
+	blk_t first;
+	blk_t last;
+	blk_t read_errors;
+	blk_t write_errors;
+	blk_t corruption_errors;
+};
+
+static struct status_range *status_ranges;
+static size_t status_range_count;
+static size_t status_range_capacity;
+static struct timeval status_last_flush;
+static int status_timer_started;
+
+static int range_status_enabled(void)
+{
+	return s_flag || v_flag > 1;
+}
+
+static void print_status_range(const struct status_range *range)
+{
+	fprintf(stderr, range->bad ?
+		"bad %llu-%llu is bad,(%llu/%llu/%llu errors)\r\n" :
+		"scan %llu-%llu passed,(%llu/%llu/%llu errors)\r\n",
+		(unsigned long long) range->first,
+		(unsigned long long) range->last,
+		(unsigned long long) range->read_errors,
+		(unsigned long long) range->write_errors,
+		(unsigned long long) range->corruption_errors);
+}
+
+static void flush_status_ranges(void)
+{
+	size_t i;
+
+	for (i = 0; i < status_range_count; i++)
+		print_status_range(&status_ranges[i]);
+	status_range_count = 0;
+	fflush(stderr);
+}
+
+static void start_range_status(void)
+{
+	if (!range_status_enabled())
+		return;
+	status_range_count = 0;
+	gettimeofday(&status_last_flush, NULL);
+	status_timer_started = 1;
+}
+
+static int status_flush_due(struct timeval *now)
+{
+	long long elapsed;
+
+	gettimeofday(now, NULL);
+	if (!status_timer_started) {
+		status_last_flush = *now;
+		status_timer_started = 1;
+		return 0;
+	}
+	elapsed = (long long) (now->tv_sec - status_last_flush.tv_sec) *
+		1000000 + now->tv_usec - status_last_flush.tv_usec;
+	return elapsed >= (long long) status_interval * 1000000;
+}
+
+static void record_status_range(int bad, blk_t first, unsigned int count)
+{
+	struct status_range *range, *new_ranges;
+	struct timeval now;
+	size_t new_capacity;
+
+	if (!range_status_enabled() || !count)
+		return;
+
+	if (status_range_count) {
+		range = &status_ranges[status_range_count - 1];
+		if (range->bad == bad && first == range->last + 1) {
+			range->last = first + count - 1;
+			range->read_errors = num_read_errors;
+			range->write_errors = num_write_errors;
+			range->corruption_errors = num_corruption_errors;
+			goto maybe_flush;
+		}
+	}
+
+	if (status_range_count == status_range_capacity) {
+		new_capacity = status_range_capacity ?
+			status_range_capacity * 2 : 32;
+		new_ranges = realloc(status_ranges,
+			new_capacity * sizeof(*new_ranges));
+		if (!new_ranges) {
+			/* Progress logging must never abort a disk operation. */
+			flush_status_ranges();
+			if (status_range_capacity)
+				goto add_range;
+			else {
+				struct status_range direct = {
+					bad, first, first + count - 1,
+					num_read_errors, num_write_errors,
+					num_corruption_errors
+				};
+				print_status_range(&direct);
+				fflush(stderr);
+				goto maybe_flush;
+			}
+		}
+		status_ranges = new_ranges;
+		status_range_capacity = new_capacity;
+	}
+
+add_range:
+	range = &status_ranges[status_range_count++];
+	range->bad = bad;
+	range->first = first;
+	range->last = first + count - 1;
+	range->read_errors = num_read_errors;
+	range->write_errors = num_write_errors;
+	range->corruption_errors = num_corruption_errors;
+
+maybe_flush:
+	if (status_flush_due(&now)) {
+		flush_status_ranges();
+		status_last_flush = now;
+	}
+}
+
+static void report_bad_block(blk_t bad)
+{
+	record_status_range(1, bad, 1);
+}
+
+static void report_passed_range(blk_t first, unsigned int count)
+{
+	record_status_range(0, first, count);
+}
+
+static void finish_range_status(void)
+{
+	if (!range_status_enabled())
+		return;
+	flush_status_ranges();
+	status_timer_started = 0;
+}
 
 static void *allocate_buffer(size_t size)
 {
@@ -182,78 +326,29 @@ static int bb_output (blk_t bad, enum error_types error_type)
 	} else if (error_type == CORRUPTION_ERROR) {
 	  num_corruption_errors++;
 	}
+	report_bad_block(bad);
 	return 1;
 }
 
-static char *time_diff_format(struct timeval *tv1,
-			      struct timeval *tv2, char *buf)
+static unsigned int report_compared_blocks(unsigned char *actual,
+					   unsigned char *expected,
+					   int count, int block_size,
+					   int expected_stride,
+					   blk_t first)
 {
-        time_t	diff = (tv1->tv_sec - tv2->tv_sec);
-	int	hr,min,sec;
+	unsigned int bad_count = 0;
+	int i, good_start = 0;
 
-	sec = diff % 60;
-	diff /= 60;
-	min = diff % 60;
-	hr = diff / 60;
-
-	if (hr)
-		sprintf(buf, "%d:%02d:%02d", hr, min, sec);
-	else
-		sprintf(buf, "%d:%02d", min, sec);
-	return buf;
-}
-
-static float calc_percent(unsigned long current, unsigned long total) {
-	float percent = 0.0;
-	if (total <= 0)
-		return percent;
-	if (current >= total) {
-		percent = 100.0;
-	} else {
-		percent=(100.0*(float)current/(float)total);
+	for (i = 0; i < count; i++) {
+		if (!memcmp(actual + (size_t) i * block_size,
+			    expected + (size_t) i * expected_stride, block_size))
+			continue;
+		report_passed_range(first + good_start, i - good_start);
+		bad_count += bb_output(first + i, CORRUPTION_ERROR);
+		good_start = i + 1;
 	}
-	return percent;
-}
-
-static void print_status(void)
-{
-	struct timeval time_end;
-	char diff_buf[32], line_buf[128];
-#ifdef HAVE_MBSTOWCS
-	wchar_t wline_buf[128];
-#endif
-	int len;
-
-	gettimeofday(&time_end, 0);
-	len = snprintf(line_buf, sizeof(line_buf), 
-		       _("%6.2f%% done, %s elapsed. "
-		         "(%d/%d/%d errors)"),
-		       calc_percent((unsigned long) currently_testing,
-				    (unsigned long) num_blocks), 
-		       time_diff_format(&time_end, &time_start, diff_buf),
-		       num_read_errors,
-		       num_write_errors,
-		       num_corruption_errors);
-#ifdef HAVE_MBSTOWCS
-	mbstowcs(wline_buf, line_buf, sizeof(line_buf));
-	len = wcswidth(wline_buf, sizeof(line_buf));
-	if (len < 0)
-		len = strlen(line_buf); /* Should never happen... */
-#endif
-	fputs(line_buf, stderr);
-	memset(line_buf, '\b', len);
-	line_buf[len] = 0;
-	fputs(line_buf, stderr);	
-	fflush (stderr);
-}
-
-static void alarm_intr(int alnum EXT2FS_ATTR((unused)))
-{
-	signal (SIGALRM, alarm_intr);
-	alarm(1);
-	if (!num_blocks)
-		return;
-	print_status();
+	report_passed_range(first + good_start, count - good_start);
+	return bad_count;
 }
 
 static void *terminate_addr = NULL;
@@ -334,7 +429,7 @@ static void pattern_fill(unsigned char *buffer, unsigned int pattern,
 			(*ptr) = random() % (1 << (8 * sizeof(char)));
 		}
 		if (s_flag | v_flag)
-			fputs(_("Testing with random pattern: "), stderr);
+			fputs(_("Testing with random pattern:\r\n"), stderr);
 	} else {
 		bpattern[0] = 0;
 		for (i = 0; i < sizeof(bpattern); i++) {
@@ -355,7 +450,7 @@ static void pattern_fill(unsigned char *buffer, unsigned int pattern,
 			fputs(_("Testing with pattern 0x"), stderr);
 			for (i = 0; i <= nb; i++)
 				fprintf(stderr, "%02x", buffer[i]);
-			fputs(": ", stderr);
+			fputs(":\r\n", stderr);
 		}
 	}
 }
@@ -377,9 +472,6 @@ static int do_read (int dev, unsigned char * buffer, int try, int block_size,
 #endif
 	set_o_direct(dev, buffer, try * block_size,
 		     ((ext2_loff_t) current_block) * block_size);
-
-	if (v_flag > 1)
-		print_status();
 
 	/* Seek to the correct loc. */
 	if (ext2fs_llseek (dev, (ext2_loff_t) current_block * block_size,
@@ -451,9 +543,6 @@ static int do_write(int dev, unsigned char * buffer, int try, int block_size,
 	set_o_direct(dev, buffer, try * block_size,
 		     ((ext2_loff_t) current_block) * block_size);
 
-	if (v_flag > 1)
-		print_status();
-
 	/* Seek to the correct loc. */
 	if (ext2fs_llseek (dev, (ext2_loff_t) current_block * block_size,
 			 SEEK_SET) != (ext2_loff_t) current_block * block_size)
@@ -521,28 +610,28 @@ static unsigned int test_ro (int dev, blk_t last_block,
 		exit (1);
 	}
 	if (v_flag) {
-		fprintf(stderr, _("Checking blocks %lu to %lu\n"),
+		fprintf(stderr, _("Checking blocks %lu to %lu\r\n"),
 			(unsigned long)first_block,
 			(unsigned long)last_block - 1);
 	}
 	if (t_flag) {
-		fputs(_("Checking for bad blocks in read-only mode\n"), stderr);
+		fputs(_("Checking for bad blocks in read-only mode\r\n"), stderr);
 		pattern_fill(blkbuf + blocks_at_once * block_size,
 			     t_patts[0], block_size);
 	}
 	flush_bufs();
 	try = blocks_at_once;
 	currently_testing = first_block;
-	num_blocks = last_block - 1;
 	if (!t_flag && (s_flag || v_flag))
-		fputs(_("Checking for bad blocks (read-only test): "), stderr);
-	if (s_flag && v_flag <= 1)
-		alarm_intr(SIGALRM);
+		fputs(_("Checking for bad blocks (read-only test):\r\n"), stderr);
+	start_range_status();
 	while (currently_testing < last_block)
 	{
+		blk_t io_start;
+
 		if (bb_count >= max_bb) {
 			if (s_flag || v_flag) {
-				fputs(_("Too many bad blocks, aborting test\n"), stderr);
+				fputs(_("Too many bad blocks, aborting test\r\n"), stderr);
 			}
 			break;
 		}
@@ -558,17 +647,14 @@ static unsigned int test_ro (int dev, blk_t last_block,
 		}
 		if (currently_testing + try > last_block)
 			try = last_block - currently_testing;
+		io_start = currently_testing;
 		got = do_read (dev, blkbuf, try, block_size, currently_testing);
 		if (t_flag) {
-			/* test the comparison between all the
-			   blocks successfully read  */
-			int i;
-			for (i = 0; i < got; ++i)
-				if (memcmp (blkbuf+i*block_size,
-					    blkbuf+blocks_at_once*block_size,
-					    block_size))
-					bb_count += bb_output(currently_testing + i, CORRUPTION_ERROR);
-		}
+			bb_count += report_compared_blocks(blkbuf,
+				blkbuf + blocks_at_once * block_size, got,
+				block_size, 0, io_start);
+		} else
+			report_passed_range(io_start, got);
 		if (got == 0 && try == 1)
 			bb_count += bb_output(currently_testing++, READ_ERROR);
 		currently_testing += got;
@@ -583,8 +669,7 @@ static unsigned int test_ro (int dev, blk_t last_block,
 			recover_block = ~0;
 		}
 	}
-	num_blocks = 0;
-	alarm(0);
+	finish_range_status();
 	if (s_flag || v_flag)
 		fputs(_(done_string), stderr);
 
@@ -605,7 +690,7 @@ static unsigned int test_rw (int dev, blk_t last_block,
 	unsigned char *buffer, *read_buffer;
 	const unsigned int patterns[] = {0xaa, 0x55, 0xff, 0x00};
 	const unsigned int *pattern;
-	int i, try, got, nr_pattern, pat_idx;
+	int try, got, nr_pattern, pat_idx;
 	unsigned int bb_count = 0;
 	blk_t recover_block = ~0;
 
@@ -624,9 +709,9 @@ static unsigned int test_rw (int dev, blk_t last_block,
 	flush_bufs();
 
 	if (v_flag) {
-		fputs(_("Checking for bad blocks in read-write mode\n"),
+		fputs(_("Checking for bad blocks in read-write mode\r\n"),
 		      stderr);
-		fprintf(stderr, _("From block %lu to %lu\n"),
+		fprintf(stderr, _("From block %lu to %lu\r\n"),
 			(unsigned long) first_block,
 			(unsigned long) last_block - 1);
 	}
@@ -640,25 +725,25 @@ static unsigned int test_rw (int dev, blk_t last_block,
 	for (pat_idx = 0; pat_idx < nr_pattern; pat_idx++) {
 		pattern_fill(buffer, pattern[pat_idx],
 			     blocks_at_once * block_size);
-		num_blocks = last_block - 1;
 		currently_testing = first_block;
-		if (s_flag && v_flag <= 1)
-			alarm_intr(SIGALRM);
 
 		try = blocks_at_once;
+		start_range_status();
 		while (currently_testing < last_block) {
+			blk_t io_start;
+
 			if (bb_count >= max_bb) {
 				if (s_flag || v_flag) {
-					fputs(_("Too many bad blocks, aborting test\n"), stderr);
+					fputs(_("Too many bad blocks, aborting test\r\n"), stderr);
 				}
 				break;
 			}
 			if (currently_testing + try > last_block)
 				try = last_block - currently_testing;
+			io_start = currently_testing;
 			got = do_write(dev, buffer, try, block_size,
 					currently_testing);
-			if (v_flag > 1)
-				print_status();
+			report_passed_range(io_start, got);
 
 			if (got == 0 && try == 1)
 				bb_count += bb_output(currently_testing++, WRITE_ERROR);
@@ -675,32 +760,36 @@ static unsigned int test_rw (int dev, blk_t last_block,
 			}
 		}
 
-		num_blocks = 0;
-		alarm (0);
+		finish_range_status();
 		if (s_flag | v_flag)
 			fputs(_(done_string), stderr);
 		flush_bufs();
 		if (s_flag | v_flag)
-			fputs(_("Reading and comparing: "), stderr);
-		num_blocks = last_block;
+			fputs(_("Reading and comparing:\r\n"), stderr);
 		currently_testing = first_block;
-		if (s_flag && v_flag <= 1)
-			alarm_intr(SIGALRM);
 
 		try = blocks_at_once;
+		start_range_status();
 		while (currently_testing < last_block) {
+			blk_t io_start;
+
 			if (bb_count >= max_bb) {
 				if (s_flag || v_flag) {
-					fputs(_("Too many bad blocks, aborting test\n"), stderr);
+					fputs(_("Too many bad blocks, aborting test\r\n"), stderr);
 				}
 				break;
 			}
 			if (currently_testing + try > last_block)
 				try = last_block - currently_testing;
+			io_start = currently_testing;
 			got = do_read (dev, read_buffer, try, block_size,
 				       currently_testing);
-			if (got == 0 && try == 1)
+			if (got == 0 && try == 1) {
 				bb_count += bb_output(currently_testing++, READ_ERROR);
+			} else {
+				bb_count += report_compared_blocks(read_buffer, buffer,
+					got, block_size, block_size, io_start);
+			}
 			currently_testing += got;
 			if (got != try) {
 				try = 1;
@@ -712,18 +801,9 @@ static unsigned int test_rw (int dev, blk_t last_block,
 				try = blocks_at_once;
 				recover_block = ~0U;
 			}
-			for (i=0; i < got; i++) {
-				if (memcmp(read_buffer + i * block_size,
-					   buffer + i * block_size,
-					   block_size))
-					bb_count += bb_output(currently_testing+i, CORRUPTION_ERROR);
-			}
-			if (v_flag > 1)
-				print_status();
 		}
 
-		num_blocks = 0;
-		alarm (0);
+		finish_range_status();
 		if (s_flag | v_flag)
 			fputs(_(done_string), stderr);
 		flush_bufs();
@@ -787,19 +867,18 @@ static unsigned int test_nd (int dev, blk_t last_block,
 
 	flush_bufs();
 	if (v_flag) {
-	    fputs(_("Checking for bad blocks in non-destructive read-write mode\n"), stderr);
-	    fprintf (stderr, _("From block %lu to %lu\n"),
+	    fputs(_("Checking for bad blocks in non-destructive read-write mode\r\n"), stderr);
+	    fprintf (stderr, _("From block %lu to %lu\r\n"),
 		     (unsigned long) first_block,
 		     (unsigned long) last_block - 1);
 	}
 	if (s_flag || v_flag > 1) {
-		fputs(_("Checking for bad blocks (non-destructive read-write test)\n"), stderr);
+		fputs(_("Checking for bad blocks (non-destructive read-write test)\r\n"), stderr);
 	}
 	if (setjmp(terminate_env)) {
 		/*
 		 * Abnormal termination by a signal is handled here.
 		 */
-		signal (SIGALRM, SIG_IGN);
 		fputs(_("\nInterrupt caught, cleaning up\n"), stderr);
 
 		save_ptr = save_base;
@@ -831,14 +910,12 @@ static unsigned int test_nd (int dev, blk_t last_block,
 		save_ptr = save_base;
 		test_ptr = test_base;
 		currently_testing = first_block;
-		num_blocks = last_block - 1;
-		if (s_flag && v_flag <= 1)
-			alarm_intr(SIGALRM);
 
+		start_range_status();
 		while (currently_testing < last_block) {
 			if (bb_count >= max_bb) {
 				if (s_flag || v_flag) {
-					fputs(_("Too many bad blocks, aborting test\n"), stderr);
+					fputs(_("Too many bad blocks, aborting test\r\n"), stderr);
 				}
 				break;
 			}
@@ -944,12 +1021,9 @@ static unsigned int test_nd (int dev, blk_t last_block,
 				got = do_read (dev, read_ptr, try,
 					       block_size, currently_testing);
 
-				/* test the comparison between all the
-				   blocks successfully read  */
-				for (i = 0; i < got; ++i)
-					if (memcmp (test_ptr+i*block_size,
-						    read_ptr+i*block_size, block_size))
-						bb_count += bb_output(currently_testing + i, CORRUPTION_ERROR);
+				bb_count += report_compared_blocks(read_ptr, test_ptr,
+					got, block_size, block_size,
+					currently_testing);
 				if (got < try) {
 					bb_count += bb_output(currently_testing + got, READ_ERROR);
 					got++;
@@ -973,8 +1047,7 @@ static unsigned int test_nd (int dev, blk_t last_block,
 			test_ptr = test_base;
 			currently_testing = save_currently_testing;
 		}
-		num_blocks = 0;
-		alarm(0);
+		finish_range_status();
 		if (s_flag || v_flag > 1)
 			fputs(_(done_string), stderr);
 
@@ -1098,7 +1171,7 @@ int main (int argc, char ** argv)
 		program_name = *argv;
 	else
 		usage();
-	while ((c = getopt (argc, argv, "b:d:e:fi:o:svwnc:p:h:t:BX")) != EOF) {
+	while ((c = getopt (argc, argv, "b:d:e:fi:o:svwnc:p:h:t:BXS:")) != EOF) {
 		switch (c) {
 		case 'b':
 			block_size = parse_uint(optarg, "block size");
@@ -1114,6 +1187,15 @@ int main (int argc, char ** argv)
 			break;
 		case 's':
 			s_flag = 1;
+			break;
+		case 'S':
+			status_interval = parse_uint(optarg,
+						     "status interval");
+			if (!status_interval) {
+				com_err(program_name, 0, "%s",
+					_("Status interval must be at least one second"));
+				exit(1);
+			}
 			break;
 		case 'v':
 			v_flag++;
@@ -1266,7 +1348,6 @@ int main (int argc, char ** argv)
 	if (w_flag)
 		check_mount(device_name);
 
-	gettimeofday(&time_start, 0);
 	open_flag = O_LARGEFILE | (w_flag ? O_RDWR : O_RDONLY);
 	dev = open (device_name, open_flag);
 	if (dev == -1) {
@@ -1366,7 +1447,7 @@ int main (int argc, char ** argv)
 
 		if (v_flag)
 			fprintf(stderr,
-				_("Pass completed, %u bad blocks found. (%d/%d/%d errors)\n"),
+				_("Pass completed, %u bad blocks found. (%d/%d/%d errors)\r\n"),
 				bb_count, num_read_errors, num_write_errors, num_corruption_errors);
 
 	} while (passes_clean < num_passes);
@@ -1375,5 +1456,6 @@ int main (int argc, char ** argv)
 	if (out != stdout)
 		fclose (out);
 	free(t_patts);
+	free(status_ranges);
 	return 0;
 }

@@ -36,6 +36,10 @@ badblocks \- search a device for bad blocks
 .I num_passes
 ]
 [
+.B \-S
+.I status_interval
+]
+[
 .B \-t
 .I test_pattern
 ]
@@ -157,13 +161,25 @@ Default is 0, meaning
 will exit after the first pass.
 .TP
 .B \-s
-Show the progress of the scan by writing out rough percentage completion
-of the current badblocks pass over the disk.  Note that badblocks may do
+Show the progress of the scan by writing the exact block ranges which passed
+or failed, together with the current read, write, and corruption error counts.
+Progress records are written to standard error and terminated by CRLF, while
+the machine-readable bad block list on standard output is unchanged.
+Consecutive ranges of the same type are accumulated between status updates,
+so the amount of progress output does not depend directly on the
+.B \-c
+value.  Note that badblocks may do
 multiple test passes over the disk, in particular if the
 .B \-p
 or
 .B \-w
 option is requested by the user.
+.TP
+.BI \-S " status_interval"
+Set the progress output interval in seconds.  The default is 1 second.
+This option affects the range records enabled by
+.BR \-s .
+Any records remaining at the end of a test phase are always written.
 .TP
 .BI \-t " test_pattern"
 Specify a test pattern to be read (and written) to disk blocks.   The
