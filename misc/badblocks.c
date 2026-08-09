@@ -138,19 +138,44 @@ static size_t status_range_count;
 static size_t status_range_capacity;
 static struct timeval status_last_flush;
 static int status_timer_started;
+static blk64_t status_total_blocks;
 
 static int range_status_enabled(void)
 {
 	return s_flag || v_flag > 1;
 }
 
-static void print_status_range(const struct status_range *range)
+static void print_status_range(const struct status_range *range,
+			       unsigned long long scanned_blocks,
+			       long long elapsed_microseconds)
 {
+	unsigned long long progress_hundredths;
+	unsigned long long remaining_blocks;
+	unsigned long long estimated_seconds;
+	time_t estimated_completion;
+	struct tm completion_tm;
+	char completion_time[20];
+
+	progress_hundredths = (unsigned long long) range->last * 10000 /
+		status_total_blocks;
+	remaining_blocks = status_total_blocks - range->last - 1;
+	estimated_seconds = 0;
+	if (scanned_blocks && elapsed_microseconds > 0)
+		estimated_seconds = (unsigned long long) ((long double)
+			remaining_blocks * elapsed_microseconds / scanned_blocks /
+			1000000);
+	estimated_completion = time(NULL) + estimated_seconds;
+	localtime_r(&estimated_completion, &completion_tm);
+	strftime(completion_time, sizeof(completion_time), "%Y-%m-%d %H:%M:%S",
+		 &completion_tm);
 	fprintf(stderr, range->bad ?
 		"bad %llu-%llu is bad,(%llu/%llu/%llu errors)\r\n" :
-		"scan %llu-%llu passed,(%llu/%llu/%llu errors)\r\n",
+		"scan %llu-%llu/%llu passed,%llu.%02llu%%,ETR:%llu sec,ETA: %s,(%llu/%llu/%llu errors)\r\n",
 		(unsigned long long) range->first,
 		(unsigned long long) range->last,
+		(unsigned long long) status_total_blocks,
+		progress_hundredths / 100, progress_hundredths % 100,
+		estimated_seconds, completion_time,
 		(unsigned long long) range->read_errors,
 		(unsigned long long) range->write_errors,
 		(unsigned long long) range->corruption_errors);
@@ -159,10 +184,23 @@ static void print_status_range(const struct status_range *range)
 static void flush_status_ranges(void)
 {
 	size_t i;
+	unsigned long long scanned_blocks = 0;
+	long long elapsed_microseconds;
+	struct timeval now;
+
+	gettimeofday(&now, NULL);
+	elapsed_microseconds = (long long) (now.tv_sec -
+		status_last_flush.tv_sec) * 1000000 + now.tv_usec -
+		status_last_flush.tv_usec;
+	for (i = 0; i < status_range_count; i++)
+		scanned_blocks += status_ranges[i].last -
+			status_ranges[i].first + 1;
 
 	for (i = 0; i < status_range_count; i++)
-		print_status_range(&status_ranges[i]);
+		print_status_range(&status_ranges[i], scanned_blocks,
+			elapsed_microseconds);
 	status_range_count = 0;
+	status_last_flush = now;
 	fflush(stderr);
 }
 
@@ -226,7 +264,7 @@ static void record_status_range(int bad, blk_t first, unsigned int count)
 					num_read_errors, num_write_errors,
 					num_corruption_errors
 				};
-				print_status_range(&direct);
+				print_status_range(&direct, count, 0);
 				fflush(stderr);
 				goto maybe_flush;
 			}
@@ -247,7 +285,6 @@ add_range:
 maybe_flush:
 	if (status_flush_due(&now)) {
 		flush_status_ranges();
-		status_last_flush = now;
 	}
 }
 
@@ -1345,6 +1382,7 @@ int main (int argc, char ** argv)
 			(unsigned long long) last_block);
 		exit(1);
 	}
+	status_total_blocks = last_block;
 	if (w_flag)
 		check_mount(device_name);
 
