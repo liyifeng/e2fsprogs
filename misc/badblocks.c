@@ -138,6 +138,7 @@ static size_t status_range_count;
 static size_t status_range_capacity;
 static struct timeval status_last_flush;
 static int status_timer_started;
+static blk64_t status_first_block;
 static blk64_t status_total_blocks;
 
 static int range_status_enabled(void)
@@ -153,12 +154,16 @@ static void print_status_range(const struct status_range *range,
 	unsigned long long remaining_blocks;
 	unsigned long long estimated_seconds;
 	time_t estimated_completion;
+	time_t now;
 	struct tm completion_tm;
+	struct tm now_tm;
 	char completion_time[20];
+	char timestamp[20];
 
-	progress_hundredths = (unsigned long long) range->last * 10000 /
-		status_total_blocks;
-	remaining_blocks = status_total_blocks - range->last - 1;
+	progress_hundredths = (unsigned long long) (range->last -
+		status_first_block + 1) * 10000 / status_total_blocks;
+	remaining_blocks = status_total_blocks - (range->last -
+		status_first_block + 1);
 	estimated_seconds = 0;
 	if (scanned_blocks && elapsed_microseconds > 0)
 		estimated_seconds = (unsigned long long) ((long double)
@@ -168,17 +173,30 @@ static void print_status_range(const struct status_range *range,
 	localtime_r(&estimated_completion, &completion_tm);
 	strftime(completion_time, sizeof(completion_time), "%Y-%m-%d %H:%M:%S",
 		 &completion_tm);
-	fprintf(stderr, range->bad ?
-		"bad %llu-%llu is bad,(%llu/%llu/%llu errors)\r\n" :
-		"scan %llu-%llu/%llu passed,%llu.%02llu%%,ETR:%llu sec,ETA: %s,(%llu/%llu/%llu errors)\r\n",
-		(unsigned long long) range->first,
-		(unsigned long long) range->last,
-		(unsigned long long) status_total_blocks,
-		progress_hundredths / 100, progress_hundredths % 100,
-		estimated_seconds, completion_time,
-		(unsigned long long) range->read_errors,
-		(unsigned long long) range->write_errors,
-		(unsigned long long) range->corruption_errors);
+	now = time(NULL);
+	localtime_r(&now, &now_tm);
+	strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &now_tm);
+	if (range->bad) {
+		fprintf(stderr, "%s bad %llu-%llu is bad,(%llu/%llu/%llu errors)\r\n",
+			timestamp,
+			(unsigned long long) range->first,
+			(unsigned long long) range->last,
+			(unsigned long long) range->read_errors,
+			(unsigned long long) range->write_errors,
+			(unsigned long long) range->corruption_errors);
+	} else {
+		fprintf(stderr,
+			"%s scan %llu-%llu/%llu passed,%llu.%02llu%%,ETR:%llu sec,ETA: %s,(%llu/%llu/%llu errors)\r\n",
+			timestamp,
+			(unsigned long long) range->first,
+			(unsigned long long) range->last,
+			(unsigned long long) status_total_blocks,
+			progress_hundredths / 100, progress_hundredths % 100,
+			estimated_seconds, completion_time,
+			(unsigned long long) range->read_errors,
+			(unsigned long long) range->write_errors,
+			(unsigned long long) range->corruption_errors);
+	}
 }
 
 static void flush_status_ranges(void)
@@ -1382,7 +1400,8 @@ int main (int argc, char ** argv)
 			(unsigned long long) last_block);
 		exit(1);
 	}
-	status_total_blocks = last_block;
+	status_first_block = first_block;
+	status_total_blocks = last_block - first_block;
 	if (w_flag)
 		check_mount(device_name);
 
