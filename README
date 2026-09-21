@@ -1,3 +1,9 @@
+# 当前分支改动说明
+
+本分支优化了 `badblocks` 的扫描日志输出：进度日志改为带时间戳的结构化记录，可清晰展示扫描区间、扫描进度、错误数量和预计完成时间，便于查看和采集日志。
+
+同时新增进度日志输出间隔配置，可按需控制日志刷新频率；相关使用说明已同步更新。
+
 	This is the new version (1.47.4) of the second extended file
 system management programs.
 
@@ -16,4 +22,3 @@ are supplied as well.
 tytso@mit.edu or tytso@alum.mit.edu.  See the e2fsck man page for
 suggestions of what sort of information to include when submitting bug
 reports for these programs.
-
